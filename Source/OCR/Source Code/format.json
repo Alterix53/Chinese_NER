@@ -1,0 +1,36 @@
+{
+    "FILE": {
+        "ID": "",
+        "meta": {
+            "TITLE": "",
+            "VOLUME": "",
+            "AUTHOR": "",
+            "PERIOD": "",
+            "LANGUAGE": "",
+            "SOURCE": ""
+        },
+        "SECT": {
+            "ID": "",
+            "NAME": "",
+            "PAGES": [
+                {
+                    "ID": "",
+                    "STC": [
+                        {
+                            "ID": "",
+                            "text": ""
+                        },
+                        {
+                            "ID": "",
+                            "text": ""
+                        },
+                        {
+                            "ID": "",
+                            "text": ""
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+}
