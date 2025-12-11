@@ -130,6 +130,9 @@ def thread_post_processing(queue_in, metadata_path, format_path):
         pts = np.array(points)
         return np.mean(pts, axis=0)
 
+    # Accumulate all pages: books_data[pdf_name] = [ {page_index:..., data:...}, ... ]
+    books_data = {}
+
     while True:
         task = queue_in.get()
         if task is None:
@@ -142,176 +145,136 @@ def thread_post_processing(queue_in, metadata_path, format_path):
             pdf_name = task.get("pdf_name") # e.g. a_q01
             page_index = task.get("page_index") # 0-based
             
-            # 1. Parse Identifiers
-            # Metadata: ID (HVNH), VOLUME (112 or "")
-            meta_id = metadata.get("ID", "UNK")
-            volume = metadata.get("VOLUME", "").strip()
+            # Read Raw JSON
+            if raw_json_path and os.path.exists(raw_json_path):
+                with open(raw_json_path, 'r', encoding='utf-8') as f:
+                    raw_data = json.load(f)
+                
+                # Sort Text Blocks (Vertical: Right-to-Left -> Descending X)
+                # Secondary sort: Top-to-Bottom -> Ascending Y
+                def sort_key(item):
+                    c = get_centroid(item["points"])
+                    return (-c[0], c[1]) # -x, y
+                
+                sorted_data = sorted(raw_data, key=sort_key)
+                
+                if pdf_name not in books_data:
+                    books_data[pdf_name] = []
+                
+                books_data[pdf_name].append({
+                    "page_index": page_index,
+                    "data": sorted_data,
+                    "raw_path": raw_json_path
+                })
             
-            # Parse 'q01' from 'a_q01'
-            # Assumption: pdf_name format is {name}_q{number}
-            # Regex to find 'q' followed by digits or hyphens (e.g. q01, q01-02)
-            match = re.search(r'_q([0-9\-]+)', pdf_name)
+        except Exception as e:
+            print(f"[Thread-4] Error processing page task: {e}")
+        finally:
+            queue_in.task_done()
+
+    # End of queue logic: Process aggregated books and write final JSONs
+    print("[Thread-4] Start aggregating and writing output files...")
+    
+    for pdf_name, pages_list in books_data.items():
+        try:
+            # Sort pages by index
+            pages_list.sort(key=lambda x: x["page_index"])
+            
+            # 1. Parse Name and Book Number from pdf_name
+            # Format expectation: {name}_q{number} -> a_q01
+            match = re.search(r'^(.*)_q([0-9\-]+)$', pdf_name)
             if match:
-                book_num = match.group(1) # '01' or '01-02'
+                book_name_val = match.group(1)
+                book_num = match.group(2)
             else:
-                # Fallback if specific naming convention not met
+                book_name_val = pdf_name
                 book_num = "00"
 
-            # Construct File ID: HVNH_01
+            # 2. Parse Identifiers
+            meta_id = metadata.get("ID", "UNK")
+            volume = metadata.get("VOLUME", "").strip()
+
+            if not volume:
+                volume = book_num
+            
+            # Construct File ID: e.g. HVNH_01
             file_id_val = f"{meta_id}_{book_num}"
             
-            # Construct Volume Suffix: 112 or 000
-            vol_digits = "".join(filter(str.isdigit, volume))
-            if not vol_digits: 
-                vol_digits = "000"
-            else:
-                # Pad to 3 chars if it looks like a number? 
-                # LSE_01_04 example in prompt has "04". 
-                # HVNH_01.112 has "112".
-                # I will just use what I found, maybe pad to 3 if < 3?
-                if len(vol_digits) < 3:
-                    vol_digits = vol_digits.zfill(3)
-
-            # SECT ID: HVNH_01.112
-            sect_id_val = f"{file_id_val}.{vol_digits}"
-
-            # 2. Read Raw JSON
-            with open(raw_json_path, 'r', encoding='utf-8') as f:
-                raw_data = json.load(f)
+            # Construct SECT ID: e.g. HVNH_01.01 (Volume 01)
+            sect_id_val = f"{file_id_val}.{volume}"
             
-            # 3. Sort Text Blocks (Vertical: Right-to-Left -> Descending X)
-            # Secondary sort: Top-to-Bottom -> Ascending Y
-            def sort_key(item):
-                c = get_centroid(item["points"])
-                return (-c[0], c[1]) # -x, y
-            
-            sorted_data = sorted(raw_data, key=sort_key)
-            
-            # 4. Fill Data Structure
+            # 3. Build Output Structure
             output_obj = copy.deepcopy(format_template)
             
-            # Fill FILE info
+            # FILE level
             f_node = output_obj["FILE"]
             f_node["ID"] = file_id_val
             
-            # Fill meta (copy from metadata.json)
-            # format.json has keys: TITLE, VOLUME, AUTHOR, PERIOD, LANGUAGE, SOURCE
-            # metadata.json has same keys + ID. 
-            # User said: "meta: lấy từ metadata.json (bỏ qua ID)"
+            # Meta
             for k in f_node["meta"]:
                 if k in metadata:
                     f_node["meta"][k] = metadata[k]
-                    
-            # Fill SECT
+            
+            # Explicitly set VOLUME in case it was inferred
+            f_node["meta"]["VOLUME"] = volume
+            
+            # SECT level
             s_node = f_node["SECT"]
             s_node["ID"] = sect_id_val
-            s_node["NAME"] = pdf_name 
+            s_node["NAME"] = book_name_val
             
-            # Fill PAGES
-            # raw_data corresponds to ONE page.
-            # format.json "PAGES" is a list. We are processing file-by-page.
-            # But the requirement usually implies aggregating?
-            # User said: "FILE: ... SECT ... PAGES: một list có 1 dict"
-            # "giả sử raw json file hiện tại là a_q01_1.json" -> It implies 1 raw file -> 1 output file?
-            # User said: "tên của fornmatted json sẽ kết hợp từ ID định danh + mã số quyển + VOLUME"
-            # If we process page by page, we would overwrite the file or need to append?
-            # User request: "nhiệm vụ lấy các raw json file ... tiến hành dựa trên format.json"
-            # "PAGES: một list có 1 dict ... gồm ID: là số trang sách hiện tại"
-            # Creates ambiguity: One huge JSON for the whole book, or 1 JSON per page?
-            # User prompt: "giả sử raw json file hiện tại à a_q01_1.json, thì ID là 001"
-            # "tên của fornmatted json ... ví dụ LSE_01_04"
-            # If I make one file LSE_01_04.json, it should contain ALL pages?
-            # But specific logic "PAGES: một list có 1 dict" suggests 1 page per file output?
-            # OR the structure only holds 1 page currently.
-            # However, filename "LSE_01_04" (Volume level) implies Book Level.
-            # If I output per page, I should probably name it `LSE_01_04_001.json`?
-            # User comment: "tên của fornmatted json sẽ ..."
-            # DOES NOT include page number in user's specified filename "LSE_01_04".
-            # This implies the file should contain ALL pages or the user is describing a single-page output that reuses that name (which would overwrite).
-            # Re-read: "PAGES: một list có 1 dict".
-            # This constraint makes it a valid JSON for exactly 1 page.
-            # So I MUST produce 1 JSON file PER page.
-            # Therefore I MUST distinguish filenames.
-            # I will add the page number to the filename: `[ID]_[Volume]_[Page].json`
-            # Wait, user said: "ví dụ a_q01 thì ID là HVNH_01" -> "HVNH_01_112".
-            # If I strictly follow "tên của fornmatted json ... là HVNH_01_112", I can't put page number.
-            # Maybe the user implies the "SECT" part is the file scope? No, "SECT... PAGES...".
-            # Let's look at the example `LSE_01_04.json` provided in context.
-            # `file:///c:/.../LSE_01_04.json`
-            # Content: "PAGES": [ { "ID": "001", "STC": [...] } ]
-            # It only has Page 001.
-            # So `LSE_01_04.json` IS the file for Page 1? Or is it a snippet?
-            # If Page 2 exists, where does it go?
-            # Maybe `LSE_01_04` IS the combined file, but the template only shows 1 page?
-            # NO, "PAGES: một list có 1 dict" -> explicitly singular "1 dict".
-            # Conclusion: The user likely wants per-page files.
-            # I will assume the user-provided name is the PREFIX or he forgot page number.
-            # BUT, to be safe and avoid overwriting, I will use: `[ID]_[Volume]_[PageID].json`.
-            # OR, perhaps `[OriginalName]_formatted.json`?
-            # No, user gave specific naming rule.
-            # I'll stick to user rule + Page suffix to ensure uniqueness, or better:
-            # Create a folder `[ID]_[Volume]` and put `[PageID].json` inside?
-            # User comment: "Save the formatted JSON to a new directory (e.g., .../data/output/a_q01/final/)"
-            # User comment 2: "tên của formatted json sẽ ..."
-            # Let's save as `.../final/[ID]_[Volume]_[PageID].json`.
-            # Actually, looking at `LSE_01_04.json` content again:
-            # ` "ID": "LSE_001.004.001.01" ` -> `ID.Volume.Page.Line`.
-            # Page ID in file is "001".
-            # I will generate specific file names `[ID]_[Volume]_[Page].json` to be safe.
-            # If I am wrong, it's safer than overwriting.
+            # PAGES level
+            output_pages = []
             
-            page_str = str(page_index + 1).zfill(3)
-            
-            # STC list
-            stc_list = []
-            col_idx = 1
-            for item in sorted_data:
-                col_str = str(col_idx).zfill(2)
-                # Text ID: SECT_ID + "." + PAGE_ID + "." + COL_ID
-                # SECT_ID = HVNH_01.112
-                # PAGE_ID = 001
-                # Result: HVNH_01.112.001.01
-                txt_id = f"{sect_id_val}.{page_str}.{col_str}"
+            for p_entry in pages_list:
+                page_idx = p_entry["page_index"]
+                sorted_items = p_entry["data"]
                 
-                stc_entry = {
-                    "ID": txt_id,
-                    "text": item.get("transcription", "")
-                }
-                stc_list.append(stc_entry)
-                col_idx += 1
+                # Page ID 3 digits: 001
+                page_str = str(page_idx + 1).zfill(3)
                 
-            # Assign to PAGES
-            # Requirement: "PAGES: một list có 1 dict"
-            page_obj = {
-                "ID": page_str,
-                "STC": stc_list
-            }
-            s_node["PAGES"] = [page_obj]
+                stc_list = []
+                col_idx = 1
+                for item in sorted_items:
+                    col_str = str(col_idx).zfill(2)
+                    # Text ID: SECT_ID + "." + PAGE_ID + "." + COL_ID
+                    txt_id = f"{sect_id_val}.{page_str}.{col_str}"
+                    
+                    stc_entry = {
+                        "ID": txt_id,
+                        "text": item.get("transcription", "")
+                    }
+                    stc_list.append(stc_entry)
+                    col_idx += 1
+                
+                output_pages.append({
+                    "ID": page_str,
+                    "STC": stc_list
+                })
             
-            # Save
-            # Output folder: .../data/output/a_q01/final/
-            # Ensure separate folder for formatted results
-            final_dir = os.path.dirname(raw_json_path).replace('json', 'final') # sibling to json
-            if not os.path.exists(final_dir):
-                # Try to put it in data/output/a_q01/final
-                # raw_json_path is .../data/output/a_q01/json/a_q01_1.json
-                # split up to parent
-                base_out = os.path.dirname(os.path.dirname(raw_json_path)) # .../data/output/a_q01
-                final_dir = os.path.join(base_out, "final")
+            s_node["PAGES"] = output_pages
             
+            # 4. Save to Final File
+            if not pages_list:
+                continue
+
+            # Determine base output dir
+            first_raw_path = pages_list[0]["raw_path"]
+            base_out = os.path.dirname(os.path.dirname(first_raw_path))
+            final_dir = os.path.join(base_out, "final")
             os.makedirs(final_dir, exist_ok=True)
             
-            # Filename: HVNH_01_112_001.json (Adding page to avoid overwrite)
-            final_name = f"{file_id_val}_{vol_digits}_{page_str}.json"
+            final_name = f"{pdf_name}.json"
             final_path = os.path.join(final_dir, final_name)
             
             with open(final_path, 'w', encoding='utf-8') as f:
                 json.dump(output_obj, f, ensure_ascii=False, indent=4)
-                            
+                
+            print(f"[Thread-4] Saved combined JSON: {final_path}")
+
         except Exception as e:
-            print(f"[Thread-4] Error: {e}")
-        finally:
-            queue_in.task_done()
+            print(f"[Thread-4] Error aggregating book {pdf_name}: {e}")
+
 
 def thread_run_ocr(queue_in, output_base_dir, queue_out=None):
     while True:
