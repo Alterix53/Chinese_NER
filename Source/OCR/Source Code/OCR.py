@@ -112,6 +112,8 @@ def thread_preprocess(queue_in, queue_out, preprocess):
         finally:
             queue_in.task_done()
             
+import pandas as pd
+
 def thread_post_processing(queue_in, metadata_path, format_path):
     # Load Metadata & Format
     try:
@@ -226,6 +228,9 @@ def thread_post_processing(queue_in, metadata_path, format_path):
             # PAGES level
             output_pages = []
             
+            # Prepare Excel Data
+            excel_rows = []
+
             for p_entry in pages_list:
                 page_idx = p_entry["page_index"]
                 sorted_items = p_entry["data"]
@@ -239,12 +244,24 @@ def thread_post_processing(queue_in, metadata_path, format_path):
                     col_str = str(col_idx).zfill(2)
                     # Text ID: SECT_ID + "." + PAGE_ID + "." + COL_ID
                     txt_id = f"{sect_id_val}.{page_str}.{col_str}"
+                    # content and box
+                    text_content = item.get("transcription", "")
+                    points = item.get("points", [])
                     
                     stc_entry = {
                         "ID": txt_id,
-                        "text": item.get("transcription", "")
+                        "text": text_content
                     }
                     stc_list.append(stc_entry)
+                    
+                    # Add to Excel rows
+                    excel_rows.append({
+                        "ID": txt_id,
+                        "Image Name": f"{pdf_name}.png",
+                        "Han Char": text_content,
+                        "Image Box": str(points)
+                    })
+                    
                     col_idx += 1
                 
                 output_pages.append({
@@ -254,23 +271,31 @@ def thread_post_processing(queue_in, metadata_path, format_path):
             
             s_node["PAGES"] = output_pages
             
-            # 4. Save to Final File
+            # 4. Save to Final Files
             if not pages_list:
                 continue
 
-            # Determine base output dir
             first_raw_path = pages_list[0]["raw_path"]
             base_out = os.path.dirname(os.path.dirname(first_raw_path))
             final_dir = os.path.join(base_out, "final")
             os.makedirs(final_dir, exist_ok=True)
             
-            final_name = f"{pdf_name}.json"
-            final_path = os.path.join(final_dir, final_name)
+            # Save JSON
+            final_json_name = f"{pdf_name}.json"
+            final_json_path = os.path.join(final_dir, final_json_name)
             
-            with open(final_path, 'w', encoding='utf-8') as f:
+            with open(final_json_path, 'w', encoding='utf-8') as f:
                 json.dump(output_obj, f, ensure_ascii=False, indent=4)
                 
-            print(f"[Thread-4] Saved combined JSON: {final_path}")
+            # Save Excel
+            if excel_rows:
+                df = pd.DataFrame(excel_rows)
+                final_xlsx_name = f"{pdf_name}.xlsx"
+                final_xlsx_path = os.path.join(final_dir, final_xlsx_name)
+                df.to_excel(final_xlsx_path, index=False)
+                print(f"[Thread-4] Saved combined JSON: {final_json_path} and Excel: {final_xlsx_path}")
+            else:
+                print(f"[Thread-4] Saved combined JSON: {final_json_path} (No data for Excel)")
 
         except Exception as e:
             print(f"[Thread-4] Error aggregating book {pdf_name}: {e}")
