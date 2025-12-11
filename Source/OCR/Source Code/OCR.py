@@ -275,10 +275,17 @@ def thread_post_processing(queue_in, metadata_path, format_path):
             if not pages_list:
                 continue
 
-            first_raw_path = pages_list[0]["raw_path"]
-            base_out = os.path.dirname(os.path.dirname(first_raw_path))
-            final_dir = os.path.join(base_out, "final")
-            os.makedirs(final_dir, exist_ok=True)
+            # Determine base output dir: Sibling to 'Source Code' logic
+            # metadata_path is inside 'Source Code' (or current working dir)
+            # We want .../OCR/ (sibling to Source Code)
+            # base_dir (Source Code) = os.path.dirname(metadata_path)
+            # parent_dir (OCR) = os.path.dirname(os.path.dirname(metadata_path))
+            # final_dir = parent_dir
+            
+            source_code_dir = os.path.dirname(metadata_path)
+            final_dir = os.path.dirname(source_code_dir)
+            
+            # os.makedirs(final_dir, exist_ok=True) # Parent likely exists
             
             # Save JSON
             final_json_name = f"{pdf_name}.json"
